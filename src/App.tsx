@@ -8,6 +8,9 @@ type Point = {
 
 type TurningCandidate = Point & {
   score: number
+  v: number
+  externalDistance: number
+  internalDistance: number
 }
 
 type SolvabilityGraph = {
@@ -50,6 +53,13 @@ function polarToCartesian(angle: number, radius: number): Point {
 
 function distance(a: Point, b: Point) {
   return Math.hypot(a.x - b.x, a.y - b.y)
+}
+
+function lerpPoint(a: Point, b: Point, t: number): Point {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+  }
 }
 
 function normalize(point: Point) {
@@ -216,6 +226,37 @@ function distancePointToSegment(point: Point, start: Point, end: Point) {
   return distance(point, projected)
 }
 
+function pointInPolygon(point: Point, polygon: Point[]) {
+  let inside = false
+
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const current = polygon[index]
+    const prior = polygon[previous]
+    const intersects =
+      current.y > point.y !== prior.y > point.y &&
+      point.x < ((prior.x - current.x) * (point.y - current.y)) / ((prior.y - current.y) || 1e-9) + current.x
+
+    if (intersects) {
+      inside = !inside
+    }
+  }
+
+  return inside
+}
+
+function distanceToOutline(point: Point, outline: Point[]) {
+  let best = Infinity
+
+  for (let index = 0; index < outline.length; index += 1) {
+    best = Math.min(
+      best,
+      distancePointToSegment(point, outline[index], outline[(index + 1) % outline.length]),
+    )
+  }
+
+  return best
+}
+
 function computeCentroid(points: Point[]) {
   const sum = points.reduce(
     (acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }),
@@ -335,35 +376,74 @@ function buildSolvabilityPath(points: Point[], minInset: number) {
   return samples.length >= 4 ? smoothRadialEnvelope(samples, 1) : samples
 }
 
+function cubicBezierPoint(points: Point[], t: number) {
+  const [p0, p1, p2, p3] = points
+  const mt = 1 - t
+  const mt2 = mt * mt
+  const mt3 = mt2 * mt
+  const t2 = t * t
+  const t3 = t2 * t
+
+  return {
+    x: mt3 * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t3 * p3.x,
+    y: mt3 * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t3 * p3.y,
+  }
+}
+
+function sampleGuideCurve(points: Point[], sampleCount: number, outline: Point[], minInset: number) {
+  if (points.length !== 4) {
+    return []
+  }
+
+  const samples: Point[] = []
+  for (let index = 0; index < sampleCount; index += 1) {
+    const point = cubicBezierPoint(points, index / (sampleCount - 1))
+    if (pointInPolygon(point, outline) && distanceToOutline(point, outline) >= minInset) {
+      samples.push(point)
+    }
+  }
+
+  return samples
+}
+
+function createDefaultGuideControlPoints(outline: Point[], minInset: number) {
+  const autoPath = buildSolvabilityPath(outline, minInset)
+  if (autoPath.length >= 4) {
+    return [0, 0.33, 0.66, 1].map((t) => {
+      const scaledIndex = t * (autoPath.length - 1)
+      const lower = Math.floor(scaledIndex)
+      const upper = Math.min(autoPath.length - 1, Math.ceil(scaledIndex))
+      return lerpPoint(autoPath[lower], autoPath[upper], scaledIndex - lower)
+    })
+  }
+
+  const { centroid, axis } = computePrincipalAxis(outline)
+  return [-0.34, -0.12, 0.12, 0.34].map((offset) => ({
+    x: centroid.x + axis.x * 120 * offset,
+    y: centroid.y + axis.y * 120 * offset,
+  }))
+}
+
 function findSolvableTurningCandidates(
-  outline: Point[],
-  toothPitch: number,
-  planetToothCount: number,
+  baseCurve: Point[],
+  guideCurveControls: Point[],
+  planetCount: number,
   minInset: number,
 ) {
-  const path = buildSolvabilityPath(outline, minInset)
+  const path = sampleGuideCurve(guideCurveControls, 64, baseCurve, minInset)
   if (path.length < 2) {
     return { path: [], samples: [], intersections: [] } satisfies SolvabilityGraph
   }
 
-  const sunToothCount = planetToothCount * 2
-  const ringToothCount = sunToothCount * 2
-  const targetSunRadius = (toothPitch * sunToothCount) / TAU
-  const targetRingRadius = (toothPitch * ringToothCount) / TAU
+  const externalRatio = planetCount
+  const internalRatio = planetCount * 2
 
   const samples = path.map((point, index) => {
-    const relativeOutline = outline.map((outlinePoint) => ({
-      x: outlinePoint.x - point.x,
-      y: outlinePoint.y - point.y,
-    }))
-    const outerOffset = averagePerimeterRadius(relativeOutline)
-    const innerProfile = extractTurningProfile(outline, point, 'inner').map((profilePoint) => ({
-      x: profilePoint.x - point.x,
-      y: profilePoint.y - point.y,
-    }))
-    const innerOffset = averagePerimeterRadius(innerProfile)
-    const externalDistance = targetRingRadius - outerOffset
-    const internalDistance = targetSunRadius + innerOffset
+    const radialDistances = baseCurve.map((curvePoint) => distance(curvePoint, point))
+    const outerRadius = Math.max(...radialDistances)
+    const innerRadius = Math.min(...radialDistances)
+    const externalDistance = outerRadius * externalRatio
+    const internalDistance = innerRadius * internalRatio
 
     return {
       point,
@@ -383,7 +463,13 @@ function findSolvableTurningCandidates(
     const nextDifference = next.difference
 
     if (Math.abs(currentDifference) < 1e-3) {
-      intersections.push({ ...current.point, score: 1 / (1 + Math.abs(currentDifference)) })
+      intersections.push({
+        ...current.point,
+        score: 1 / (1 + Math.abs(currentDifference)),
+        v: current.v,
+        externalDistance: current.externalDistance,
+        internalDistance: current.internalDistance,
+      })
       continue
     }
 
@@ -396,6 +482,9 @@ function findSolvableTurningCandidates(
       x: current.point.x + (next.point.x - current.point.x) * blend,
       y: current.point.y + (next.point.y - current.point.y) * blend,
       score: 1 / (1 + Math.abs(currentDifference) + Math.abs(nextDifference)),
+      v: current.v + (next.v - current.v) * blend,
+      externalDistance: current.externalDistance + (next.externalDistance - current.externalDistance) * blend,
+      internalDistance: current.internalDistance + (next.internalDistance - current.internalDistance) * blend,
     })
   }
 
@@ -440,6 +529,41 @@ function pointsToSmoothPath(points: Point[], cx: number, cy: number) {
   }
 
   return `${path} Z`
+}
+
+function pointsToOpenSmoothPath(points: Point[], cx: number, cy: number) {
+  if (points.length === 0) {
+    return ''
+  }
+  if (points.length === 1) {
+    return `M ${points[0].x + cx} ${points[0].y + cy}`
+  }
+  if (points.length < 3) {
+    return points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x + cx} ${point.y + cy}`)
+      .join(' ')
+  }
+
+  let path = `M ${points[0].x + cx} ${points[0].y + cy}`
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const p0 = points[Math.max(0, index - 1)]
+    const p1 = points[index]
+    const p2 = points[index + 1]
+    const p3 = points[Math.min(points.length - 1, index + 2)]
+    const cp1 = {
+      x: p1.x + (p2.x - p0.x) / 6,
+      y: p1.y + (p2.y - p0.y) / 6,
+    }
+    const cp2 = {
+      x: p2.x - (p3.x - p1.x) / 6,
+      y: p2.y - (p3.y - p1.y) / 6,
+    }
+
+    path += ` C ${cp1.x + cx} ${cp1.y + cy}, ${cp2.x + cx} ${cp2.y + cy}, ${p2.x + cx} ${p2.y + cy}`
+  }
+
+  return path
 }
 
 function translatePath(points: Point[], center: Point) {
@@ -732,7 +856,7 @@ type RingCarveResult = {
   solvable: boolean
 }
 
-type BuildStage = 'ring' | 'sun' | 'assembly'
+type BuildStage = 'diagram' | 'ring' | 'sun' | 'assembly'
 
 function searchRingCarve({
   cutterOutline,
@@ -919,13 +1043,14 @@ function App() {
   const [ringThickness, setRingThickness] = useState(DEFAULT_RING_THICKNESS)
   const [turningInset, setTurningInset] = useState(DEFAULT_TURNING_INSET)
   const [selectedTurningIndex, setSelectedTurningIndex] = useState(0)
-  const [buildStage, setBuildStage] = useState<BuildStage>('ring')
+  const [buildStage, setBuildStage] = useState<BuildStage>('diagram')
   const [showPitch, setShowPitch] = useState(true)
   const [showCenters, setShowCenters] = useState(true)
   const [showTracks, setShowTracks] = useState(true)
   const [animationSpeed, setAnimationSpeed] = useState(0.18)
   const [progress, setProgress] = useState(0)
   const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [guideDragIndex, setGuideDragIndex] = useState<number | null>(null)
 
   const editorRef = useRef<SVGSVGElement | null>(null)
 
@@ -945,9 +1070,23 @@ function App() {
       createToothedOutline(planetPitchCurve, toothCount, toothDepth, toothSharpness),
     [planetPitchCurve, toothCount, toothDepth, toothSharpness],
   )
+  const defaultGuideControlPoints = useMemo(
+    () => createDefaultGuideControlPoints(planetPitchCurve, turningInset),
+    [planetPitchCurve, turningInset],
+  )
+  const [guideControlPoints, setGuideControlPoints] = useState<Point[]>([])
+  const activeGuideControlPoints =
+    guideControlPoints.length === 4 ? guideControlPoints : defaultGuideControlPoints
+
   const solvabilityGraph = useMemo(
-    () => findSolvableTurningCandidates(planetOutline, toothPitch, toothCount, turningInset),
-    [planetOutline, toothPitch, toothCount, turningInset],
+    () =>
+      findSolvableTurningCandidates(
+        planetPitchCurve,
+        activeGuideControlPoints,
+        planetCount,
+        turningInset,
+      ),
+    [activeGuideControlPoints, planetCount, planetPitchCurve, turningInset],
   )
   const turningCandidates = solvabilityGraph.intersections
   const safeTurningIndex =
@@ -1039,6 +1178,44 @@ function App() {
   const rotatedRingPitch = ringCarve.ringPitchCurve
   const ringBlankInner = ringCarve.baseInnerBlank
   const ringBlankOuter = ringCarve.baseOuterBlank
+  const graphBounds = useMemo(() => {
+    const values = solvabilityGraph.samples.flatMap((sample) => [
+      sample.externalDistance,
+      sample.internalDistance,
+    ])
+    const minDistance = values.length > 0 ? Math.min(...values) : 0
+    const maxDistance = values.length > 0 ? Math.max(...values) : 1
+    const padding = Math.max(8, (maxDistance - minDistance) * 0.08)
+    return {
+      minDistance: minDistance - padding,
+      maxDistance: maxDistance + padding,
+    }
+  }, [solvabilityGraph.samples])
+
+  const mapGraphPoint = (v: number, d: number): Point => {
+    const left = 96
+    const right = VIEWBOX_SIZE - 72
+    const top = 84
+    const bottom = VIEWBOX_SIZE - 92
+    const width = right - left
+    const height = bottom - top
+    const vValue = left + width * v
+    const normalizedDistance =
+      (d - graphBounds.minDistance) / (graphBounds.maxDistance - graphBounds.minDistance || 1)
+    const dValue = bottom - normalizedDistance * height
+    return { x: vValue, y: dValue }
+  }
+
+  const diagramExternalCurve = solvabilityGraph.samples.map((sample) =>
+    mapGraphPoint(sample.v, sample.externalDistance),
+  )
+  const diagramInternalCurve = solvabilityGraph.samples.map((sample) =>
+    mapGraphPoint(sample.v, sample.internalDistance),
+  )
+  const diagramIntersections = turningCandidates.map((candidate) => ({
+    candidate,
+    point: mapGraphPoint(candidate.v, candidate.externalDistance),
+  }))
 
   useEffect(() => {
     let frame = 0
@@ -1086,6 +1263,45 @@ function App() {
       window.removeEventListener('pointerup', handlePointerUp)
     }
   }, [dragIndex])
+
+  useEffect(() => {
+    if (guideDragIndex === null) {
+      return
+    }
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!editorRef.current) {
+        return
+      }
+
+      const bounds = editorRef.current.getBoundingClientRect()
+      const point = {
+        x: ((event.clientX - bounds.left) / bounds.width) * EDITOR_SIZE - EDITOR_CENTER,
+        y: ((event.clientY - bounds.top) / bounds.height) * EDITOR_SIZE - EDITOR_CENTER,
+      }
+
+      if (!pointInPolygon(point, planetPitchCurve) || distanceToOutline(point, planetPitchCurve) < turningInset * 0.65) {
+        return
+      }
+
+      setGuideControlPoints((current) =>
+        (current.length === 4 ? current : activeGuideControlPoints).map((value, index) =>
+          index === guideDragIndex ? point : value,
+        ),
+      )
+    }
+
+    const handlePointerUp = () => {
+      setGuideDragIndex(null)
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerUp)
+    }
+  }, [activeGuideControlPoints, guideDragIndex, planetPitchCurve, turningInset])
 
   const exportSvg = () => {
     const paths = []
@@ -1135,6 +1351,8 @@ function App() {
     setRingThickness(DEFAULT_RING_THICKNESS)
     setTurningInset(DEFAULT_TURNING_INSET)
     setSelectedTurningIndex(0)
+    setBuildStage('diagram')
+    setGuideControlPoints([])
   }
 
   return (
@@ -1158,7 +1376,12 @@ function App() {
         <section className="panel-card">
           <div className="card-title-row">
             <h2>Planet design</h2>
-            <span>{controlRadii.length} control points</span>
+            <div className="card-title-actions">
+              <span>{controlRadii.length} control points</span>
+              <button className="ghost-button small" onClick={() => setGuideControlPoints(defaultGuideControlPoints)}>
+                Reset guide
+              </button>
+            </div>
           </div>
           <svg
             className="editor"
@@ -1200,7 +1423,7 @@ function App() {
             />
             {solvabilityGraph.path.length > 1 ? (
               <path
-                d={pointsToSmoothPath(solvabilityGraph.path, EDITOR_CENTER, EDITOR_CENTER)}
+                d={pointsToOpenSmoothPath(solvabilityGraph.path, EDITOR_CENTER, EDITOR_CENTER)}
                 className="solvability-path"
               />
             ) : null}
@@ -1214,6 +1437,26 @@ function App() {
                 onClick={() => setSelectedTurningIndex(index)}
               />
             ))}
+            {activeGuideControlPoints.length === 4 ? (
+              <>
+                <path
+                  d={activeGuideControlPoints
+                    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x + EDITOR_CENTER} ${point.y + EDITOR_CENTER}`)
+                    .join(' ')}
+                  className="guide-control-line"
+                />
+                {activeGuideControlPoints.map((point, index) => (
+                  <circle
+                    key={`guide-${index}`}
+                    cx={point.x + EDITOR_CENTER}
+                    cy={point.y + EDITOR_CENTER}
+                    r={index === 0 || index === activeGuideControlPoints.length - 1 ? 6.5 : 5.2}
+                    className="guide-handle"
+                    onPointerDown={() => setGuideDragIndex(index)}
+                  />
+                ))}
+              </>
+            ) : null}
             {controlRadii.map((radius, index) => {
               const angle = (index / controlRadii.length) * TAU
               const harmonic = Math.cos(angle * 3) * baseBias + Math.sin(angle * 2) * baseBias * 0.45
@@ -1240,8 +1483,9 @@ function App() {
             })}
           </svg>
           <p className="card-note">
-            Drag the handles to shape the planet. The green curve is the sampled solvability path;
-            only its intersections where internal and external no-slip distances match are offered.
+            Drag the white handles to shape the planet, then drag the green guide through the interior.
+            The graph step samples that guide curve and only exposes intersections where the internal and
+            external no-slip distances match.
           </p>
         </section>
 
@@ -1319,22 +1563,28 @@ function App() {
           </div>
           <div className="stage-toggle" role="tablist" aria-label="Generation steps">
             <button
+              className={buildStage === 'diagram' ? 'stage-button active' : 'stage-button'}
+              onClick={() => setBuildStage('diagram')}
+            >
+              1. Diagram
+            </button>
+            <button
               className={buildStage === 'ring' ? 'stage-button active' : 'stage-button'}
               onClick={() => setBuildStage('ring')}
             >
-              1. Ring carve
+              2. Ring carve
             </button>
             <button
               className={buildStage === 'sun' ? 'stage-button active' : 'stage-button'}
               onClick={() => setBuildStage('sun')}
             >
-              2. Sun carve
+              3. Sun carve
             </button>
             <button
               className={buildStage === 'assembly' ? 'stage-button active' : 'stage-button'}
               onClick={() => setBuildStage('assembly')}
             >
-              3. Assembly
+              4. Assembly
             </button>
           </div>
           <label>
@@ -1441,11 +1691,13 @@ function App() {
           <div>
             <p className="eyebrow">Live mechanism</p>
             <h2>
-              {buildStage === 'ring'
-                ? 'Step 1: ring carve'
-                : buildStage === 'sun'
-                  ? 'Step 2: sun carve'
-                  : 'Step 3: full assembly'}
+              {buildStage === 'diagram'
+                ? 'Step 1: solvability diagram'
+                : buildStage === 'ring'
+                  ? 'Step 2: ring carve'
+                  : buildStage === 'sun'
+                    ? 'Step 3: sun carve'
+                    : 'Step 4: full assembly'}
             </h2>
           </div>
           <p className="status-copy">
@@ -1474,117 +1726,157 @@ function App() {
             </linearGradient>
           </defs>
           <rect width={VIEWBOX_SIZE} height={VIEWBOX_SIZE} rx="34" fill="url(#viewport-bg)" />
-
-          <path
-            d={`${
-              buildStage === 'ring'
-                ? `${pointsToSmoothPath(ringBlankOuter, CENTER, CENTER)} ${pointsToSmoothPath(
-                    [...ringBlankInner].reverse(),
-                    CENTER,
-                    CENTER,
-                  )}`
-                : `${pointsToSmoothPath(rotatedRingOuterBoundary, CENTER, CENTER)} ${pointsToSmoothPath(
-                    [...rotatedRingInnerBoundary].reverse(),
-                    CENTER,
-                    CENTER,
-                  )}`
-            }`}
-            fill="url(#ring-fill)"
-            fillRule="evenodd"
-            stroke="#f7f2e8"
-            strokeWidth="2.5"
-          />
-
-          {buildStage === 'ring' ? (
-            <path
-              d={pointsToSmoothPath(rotatedRingInnerBoundary, CENTER, CENTER)}
-              fill="none"
-              stroke="#f0b758"
-              strokeWidth="2.1"
-              opacity="0.9"
-            />
-          ) : null}
-
-          {showTracks ? (
-            <circle
-              cx={CENTER}
-              cy={CENTER}
-              r={carrierRadius}
-              fill="none"
-              stroke="#5b6d76"
-              strokeDasharray="9 12"
-              opacity="0.55"
-            />
-          ) : null}
-
-          {showPitch ? (
+          {buildStage === 'diagram' ? (
+            <>
+              <line x1="96" y1={VIEWBOX_SIZE - 92} x2={VIEWBOX_SIZE - 72} y2={VIEWBOX_SIZE - 92} className="diagram-axis" />
+              <line x1="96" y1={VIEWBOX_SIZE - 92} x2="96" y2="84" className="diagram-axis" />
+              <text x={VIEWBOX_SIZE - 62} y={VIEWBOX_SIZE - 76} className="diagram-axis-label">
+                V
+              </text>
+              <text x="72" y="92" className="diagram-axis-label">
+                D
+              </text>
+              <path d={pointsToOpenSmoothPath(diagramExternalCurve, 0, 0)} className="diagram-external" />
+              <path d={pointsToOpenSmoothPath(diagramInternalCurve, 0, 0)} className="diagram-internal" />
+              {diagramIntersections.map(({ candidate, point }, index) => (
+                <g key={`diagram-intersection-${candidate.v}`}>
+                  <circle
+                    cx={point.x}
+                    cy={point.y}
+                    r={index === safeTurningIndex ? 10 : 7}
+                    className={index === safeTurningIndex ? 'diagram-hit selected' : 'diagram-hit'}
+                    onClick={() => setSelectedTurningIndex(index)}
+                  />
+                  <circle cx={point.x} cy={point.y} r="2.5" fill="#f8fff2" pointerEvents="none" />
+                </g>
+              ))}
+              <text x="132" y="40" className="diagram-readout v">
+                {`V = ${selectedTurningCenter.v?.toFixed(3) ?? '--'}`}
+              </text>
+              <text x="380" y="40" className="diagram-readout d">
+                {`Distance = ${selectedTurningCenter.externalDistance?.toFixed(3) ?? '--'}`}
+              </text>
+              <text x="132" y="66" className="diagram-legend external">
+                {`External Gear Graph Rotation Ratio: ${planetCount}/1`}
+              </text>
+              <text x="132" y="90" className="diagram-legend internal">
+                {`Internal Gear Graph Rotation Ratio: ${planetCount * 2}/1`}
+              </text>
+            </>
+          ) : (
             <>
               <path
-                d={pointsToSmoothPath(planetPitchCurve, CENTER, CENTER)}
-                fill="none"
-                stroke="#f2b14a"
-                strokeWidth="1.5"
-                opacity="0.42"
+                d={`${
+                  buildStage === 'ring'
+                    ? `${pointsToSmoothPath(ringBlankOuter, CENTER, CENTER)} ${pointsToSmoothPath(
+                        [...ringBlankInner].reverse(),
+                        CENTER,
+                        CENTER,
+                      )}`
+                    : `${pointsToSmoothPath(rotatedRingOuterBoundary, CENTER, CENTER)} ${pointsToSmoothPath(
+                        [...rotatedRingInnerBoundary].reverse(),
+                        CENTER,
+                        CENTER,
+                      )}`
+                }`}
+                fill="url(#ring-fill)"
+                fillRule="evenodd"
+                stroke="#f7f2e8"
+                strokeWidth="2.5"
               />
-              <path
-                d={pointsToSmoothPath(rotatedRingPitch, CENTER, CENTER)}
-                fill="none"
-                stroke="#8fd3ff"
-                strokeWidth="1.4"
-                opacity="0.34"
-              />
-              {buildStage !== 'ring' ? (
+
+              {buildStage === 'ring' ? (
                 <path
-                  d={pointsToSmoothPath(rotatedSunPitch, CENTER, CENTER)}
+                  d={pointsToSmoothPath(rotatedRingInnerBoundary, CENTER, CENTER)}
                   fill="none"
-                  stroke="#ffe082"
-                  strokeWidth="1.3"
-                  opacity="0.45"
+                  stroke="#f0b758"
+                  strokeWidth="2.1"
+                  opacity="0.9"
                 />
               ) : null}
-            </>
-          ) : null}
 
-          {buildStage !== 'ring' && mechanism.sunContinuous ? (
-            <path
-              d={pointsToSmoothPath(rotatedSunOutline, CENTER, CENTER)}
-              fill="#f0b758"
-              stroke="#fff2d8"
-              strokeWidth="1.5"
-            />
-          ) : null}
-
-          {(buildStage === 'ring' ? currentFrames.outlineFrames.slice(0, 1) : orbitTrack).map((planet, index) => (
-            <path
-              key={`planet-${index}`}
-              d={pointsToSmoothPath(translatePath(planet, { x: CENTER, y: CENTER }), 0, 0)}
-              fill="url(#planet-fill)"
-              stroke="#f0eadf"
-              strokeWidth="1.3"
-            />
-          ))}
-
-          {showCenters
-            ? turningCandidates.map((candidate, index) => (
+              {showTracks ? (
                 <circle
-                  key={`center-${candidate.x}-${candidate.y}`}
-                  cx={candidate.x + CENTER}
-                  cy={candidate.y + CENTER}
-                  r={index === safeTurningIndex ? 7 : 4}
-                  fill={index === safeTurningIndex ? '#5af2b3' : '#2c7f62'}
-                  opacity={0.85}
+                  cx={CENTER}
+                  cy={CENTER}
+                  r={carrierRadius}
+                  fill="none"
+                  stroke="#5b6d76"
+                  strokeDasharray="9 12"
+                  opacity="0.55"
                 />
-              ))
-            : null}
+              ) : null}
 
-          <circle cx={CENTER} cy={CENTER} r="8" fill="#d8a455" />
-          <text x="28" y="42" className="viewport-label">{`Pitch: ${toothPitch.toFixed(2)}`}</text>
-          <text
-            x="28"
-            y="68"
-            className="viewport-label"
-          >{`Avg radii P/S: ${averagePlanetRadius.toFixed(1)} / ${averageSunRadius.toFixed(1)}`}</text>
-          <text x="28" y="94" className="viewport-label">{`Loop turns: ${loopTurns}`}</text>
+              {showPitch ? (
+                <>
+                  <path
+                    d={pointsToSmoothPath(planetPitchCurve, CENTER, CENTER)}
+                    fill="none"
+                    stroke="#f2b14a"
+                    strokeWidth="1.5"
+                    opacity="0.42"
+                  />
+                  <path
+                    d={pointsToSmoothPath(rotatedRingPitch, CENTER, CENTER)}
+                    fill="none"
+                    stroke="#8fd3ff"
+                    strokeWidth="1.4"
+                    opacity="0.34"
+                  />
+                  {buildStage !== 'ring' ? (
+                    <path
+                      d={pointsToSmoothPath(rotatedSunPitch, CENTER, CENTER)}
+                      fill="none"
+                      stroke="#ffe082"
+                      strokeWidth="1.3"
+                      opacity="0.45"
+                    />
+                  ) : null}
+                </>
+              ) : null}
+
+              {buildStage !== 'ring' && mechanism.sunContinuous ? (
+                <path
+                  d={pointsToSmoothPath(rotatedSunOutline, CENTER, CENTER)}
+                  fill="#f0b758"
+                  stroke="#fff2d8"
+                  strokeWidth="1.5"
+                />
+              ) : null}
+
+              {(buildStage === 'ring' ? currentFrames.outlineFrames.slice(0, 1) : orbitTrack).map((planet, index) => (
+                <path
+                  key={`planet-${index}`}
+                  d={pointsToSmoothPath(translatePath(planet, { x: CENTER, y: CENTER }), 0, 0)}
+                  fill="url(#planet-fill)"
+                  stroke="#f0eadf"
+                  strokeWidth="1.3"
+                />
+              ))}
+
+              {showCenters
+                ? turningCandidates.map((candidate, index) => (
+                    <circle
+                      key={`center-${candidate.x}-${candidate.y}`}
+                      cx={candidate.x + CENTER}
+                      cy={candidate.y + CENTER}
+                      r={index === safeTurningIndex ? 7 : 4}
+                      fill={index === safeTurningIndex ? '#5af2b3' : '#2c7f62'}
+                      opacity={0.85}
+                    />
+                  ))
+                : null}
+
+              <circle cx={CENTER} cy={CENTER} r="8" fill="#d8a455" />
+              <text x="28" y="42" className="viewport-label">{`Pitch: ${toothPitch.toFixed(2)}`}</text>
+              <text
+                x="28"
+                y="68"
+                className="viewport-label"
+              >{`Avg radii P/S: ${averagePlanetRadius.toFixed(1)} / ${averageSunRadius.toFixed(1)}`}</text>
+              <text x="28" y="94" className="viewport-label">{`Loop turns: ${loopTurns}`}</text>
+            </>
+          )}
         </svg>
       </main>
     </div>

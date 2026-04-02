@@ -48,6 +48,12 @@
   margin: 0;
 }
 
+.card-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .panel-header h1 {
   font-size: 2.15rem;
   line-height: 1.02;
@@ -74,6 +80,11 @@
   color: var(--heading);
   background: rgba(130, 156, 171, 0.12);
   border: 1px solid var(--panel-border);
+}
+
+.ghost-button.small {
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
 }
 
 .export-button {
@@ -120,6 +131,20 @@
   stroke: #51d38e;
   stroke-width: 2;
   opacity: 0.9;
+}
+
+.guide-control-line {
+  fill: none;
+  stroke: rgba(81, 211, 142, 0.35);
+  stroke-width: 1.1;
+  stroke-dasharray: 6 6;
+}
+
+.guide-handle {
+  fill: #51d38e;
+  stroke: #081015;
+  stroke-width: 2;
+  cursor: grab;
 }
 
 .turning-candidate {
@@ -265,6 +290,64 @@
   fill: rgba(244, 238, 230, 0.85);
   font-size: 18px;
   letter-spacing: 0.04em;
+}
+
+.diagram-axis {
+  stroke: rgba(233, 232, 226, 0.9);
+  stroke-width: 3;
+}
+
+.diagram-axis-label {
+  fill: #1ef18d;
+  font-size: 28px;
+  font-weight: 700;
+}
+
+.diagram-external,
+.diagram-internal {
+  fill: none;
+  stroke-width: 3.2;
+}
+
+.diagram-external {
+  stroke: #c44330;
+}
+
+.diagram-internal {
+  stroke: #c2d159;
+}
+
+.diagram-hit {
+  fill: rgba(255, 86, 196, 0.18);
+  stroke: #ff66d8;
+  stroke-width: 3;
+  cursor: pointer;
+}
+
+.diagram-hit.selected {
+  fill: rgba(255, 86, 196, 0.26);
+}
+
+.diagram-readout,
+.diagram-legend {
+  font-size: 18px;
+  letter-spacing: 0.03em;
+}
+
+.diagram-readout.v {
+  fill: #17ec84;
+}
+
+.diagram-readout.d {
+  fill: #2947ff;
+}
+
+.diagram-legend.external {
+  fill: #c44330;
+}
+
+.diagram-legend.internal {
+  fill: #c2d159;
 }
 
 @media (max-width: 1180px) {
