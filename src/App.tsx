@@ -572,6 +572,28 @@ function averagePerimeterRadius(points: Point[]) {
   return computeArcLengths(points).total / TAU
 }
 
+function averageEdgeLength(points: Point[]) {
+  return computeArcLengths(points).total / Math.max(points.length, 1)
+}
+
+function maxEdgeLength(points: Point[]) {
+  let maxLength = 0
+  for (let index = 0; index < points.length; index += 1) {
+    maxLength = Math.max(maxLength, distance(points[index], points[(index + 1) % points.length]))
+  }
+  return maxLength
+}
+
+function maxRadialJump(points: Point[]) {
+  let maxJump = 0
+  for (let index = 0; index < points.length; index += 1) {
+    const currentRadius = Math.hypot(points[index].x, points[index].y)
+    const nextRadius = Math.hypot(points[(index + 1) % points.length].x, points[(index + 1) % points.length].y)
+    maxJump = Math.max(maxJump, Math.abs(nextRadius - currentRadius))
+  }
+  return maxJump
+}
+
 function normalizeAngle(angle: number) {
   return ((angle % TAU) + TAU) % TAU
 }
@@ -691,6 +713,7 @@ type MechanismGeometry = {
   sunPitchCurve: Point[]
   ringPitchError: number
   sunPitchError: number
+  sunContinuous: boolean
   solvable: boolean
 }
 
@@ -859,6 +882,12 @@ function buildMechanismFromRingCarve({
   )
   const sunPitchLength = computeArcLengths(sunPitchCurve).total
   const sunPitchError = Math.abs(sunPitchLength / toothPitch - sunToothCount)
+  const sunAverageRadius = averagePerimeterRadius(sunPitchCurve)
+  const sunContinuous =
+    Math.abs(computeSignedArea(sunPitchCurve)) > 1 &&
+    maxEdgeLength(sunPitchCurve) / Math.max(averageEdgeLength(sunPitchCurve), 1e-6) < 3 &&
+    maxRadialJump(sunPitchCurve) / Math.max(sunAverageRadius, 1e-6) < 0.22 &&
+    Math.abs(sunAverageRadius - ringCarve.targetSunRadius) / Math.max(ringCarve.targetSunRadius, 1e-6) < 0.18
 
   return {
     carrierRadius: ringCarve.carrierRadius,
@@ -873,7 +902,8 @@ function buildMechanismFromRingCarve({
     sunPitchCurve,
     ringPitchError: ringCarve.ringPitchError,
     sunPitchError,
-    solvable: ringCarve.solvable && sunPitchError < 0.18,
+    sunContinuous,
+    solvable: ringCarve.solvable && sunPitchError < 0.18 && sunContinuous,
   }
 }
 
@@ -975,13 +1005,17 @@ function App() {
   )
   const { carrierRadius, planetSpinFactor, sunSpinFactor, ringToothCount, sunToothCount } =
     mechanism
-  const isSolvable = turningCandidates.length > 0 && ringCarve.solvable
+  const isSolvable = turningCandidates.length > 0 && mechanism.solvable
   const solvabilityCopy =
     turningCandidates.length === 0
       ? 'No internal turning center found for this shape.'
-      : isSolvable
-        ? 'Step 1 ring carve currently passes the app’s checks.'
-        : 'Step 1 ring carve does not currently pass the app’s checks.'
+      : !ringCarve.solvable
+        ? 'Step 1 ring carve fails the no-slip ring continuity checks.'
+        : !mechanism.sunContinuous
+          ? 'Step 2 sun carve does not resolve to one continuous valid curve.'
+          : !mechanism.solvable
+            ? 'This shape does not close as a printable planetary gear system.'
+            : 'This shape currently passes the ring and sun no-slip checks.'
   const loopTurns = useMemo(
     () => findRepeatTurns([planetSpinFactor, sunSpinFactor]),
     [planetSpinFactor, sunSpinFactor],
@@ -1511,7 +1545,7 @@ function App() {
             </>
           ) : null}
 
-          {buildStage !== 'ring' ? (
+          {buildStage !== 'ring' && mechanism.sunContinuous ? (
             <path
               d={pointsToSmoothPath(rotatedSunOutline, CENTER, CENTER)}
               fill="#f0b758"
