@@ -1,0 +1,57 @@
+:root {
+  color-scheme: dark;
+  --bg: #05090d;
+  --bg-2: #101922;
+  --panel-bg: rgba(10, 16, 22, 0.82);
+  --panel-border: rgba(130, 156, 171, 0.18);
+  --panel-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+  --heading: #f4eee6;
+  --body: #d3c9bc;
+  --muted: #98a9b4;
+  --accent: #f0b758;
+  --accent-2: #88f1d4;
+  --font-sans: 'Avenir Next', 'Segoe UI', sans-serif;
+  --font-display: 'Iowan Old Style', 'Palatino Linotype', serif;
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--body);
+  background:
+    radial-gradient(circle at top, rgba(42, 69, 88, 0.55), transparent 36%),
+    radial-gradient(circle at 20% 20%, rgba(189, 132, 53, 0.15), transparent 25%),
+    linear-gradient(180deg, var(--bg-2), var(--bg));
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  color: var(--heading);
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+}
