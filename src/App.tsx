@@ -1361,8 +1361,8 @@ function buildMechanismFromRingCarve({
   innerToothedCutter,
   turningCenter,
   planetCount,
+  planetToothCount,
   sunTurnsPerOrbit,
-  toothPitch,
   toothDepth,
   toothSharpness,
 }: {
@@ -1371,13 +1371,13 @@ function buildMechanismFromRingCarve({
   innerToothedCutter: Point[]
   turningCenter: Point
   planetCount: number
+  planetToothCount: number
   sunTurnsPerOrbit: number
-  toothPitch: number
   toothDepth: number
   toothSharpness: number
 }): MechanismGeometry {
   const sampleCount = 1080
-  const sunToothCount = ringCarve.sunToothCount
+  const sunToothCount = Math.max(6, Math.round(planetToothCount * Math.max(1, Math.abs(sunTurnsPerOrbit))))
   const sunSpinFactor = Math.max(0.25, sunTurnsPerOrbit)
   const sunFrames = samplePlanetMotion(
     innerPitchCutter,
@@ -1397,16 +1397,9 @@ function buildMechanismFromRingCarve({
     5760,
     5,
   )
-  const sunPitchCurve = resampleClosedPolyline(
+  const baseSunPitchCurve = resampleClosedPolyline(
     sunEnvelope,
     Math.max(960, sunToothCount * 72),
-  )
-  const sunOutline = createToothedOutline(
-    sunPitchCurve,
-    sunToothCount,
-    toothDepth,
-    toothSharpness,
-    false,
   )
   const toothedFrames = samplePlanetMotion(
     innerToothedCutter,
@@ -1416,29 +1409,65 @@ function buildMechanismFromRingCarve({
     Math.max(240, Math.floor(sampleCount / 2)),
   )
   const expandedToothedFrames = expandFramesForPlanets(toothedFrames, planetCount)
+  let bestSunPitchCurve = baseSunPitchCurve
+  let bestSunOutline = createToothedOutline(
+    baseSunPitchCurve,
+    sunToothCount,
+    toothDepth,
+    toothSharpness,
+    false,
+  )
   let sunPhaseOffset = 0
-  let bestPhaseScore = Number.POSITIVE_INFINITY
+  let bestCombinedScore = Number.POSITIVE_INFINITY
   const phaseCandidates = Math.max(96, sunToothCount * 8)
-  const sunRadialLookup = buildRadialLookup(sunOutline, 4096, 'outer')
+  const scaleCandidates = Array.from({ length: 17 }, (_, index) => 0.8 + index * 0.03)
 
-  for (let phaseIndex = 0; phaseIndex < phaseCandidates; phaseIndex += 1) {
-    const candidateOffset = (phaseIndex / phaseCandidates) * TAU
-    const contact = measureSunContactError(
-      expandedToothedFrames,
-      sunRadialLookup,
-      sunSpinFactor,
-      candidateOffset,
+  scaleCandidates.forEach((scale) => {
+    const scaledPitch = baseSunPitchCurve.map((point) => ({ x: point.x * scale, y: point.y * scale }))
+    const scaledOutline = createToothedOutline(
+      scaledPitch,
+      sunToothCount,
+      toothDepth,
+      toothSharpness,
+      false,
     )
-    const phaseScore = contact.overlap * 320 + contact.clearance * 4 + contact.minGapRms * 14
+    const sunRadialLookup = buildRadialLookup(scaledOutline, 4096, 'outer')
+    const averageRadius = averagePerimeterRadius(scaledPitch)
+    let localBestPhase = 0
+    let localBestScore = Number.POSITIVE_INFINITY
 
-    if (phaseScore < bestPhaseScore) {
-      bestPhaseScore = phaseScore
-      sunPhaseOffset = candidateOffset
+    for (let phaseIndex = 0; phaseIndex < phaseCandidates; phaseIndex += 1) {
+      const candidateOffset = (phaseIndex / phaseCandidates) * TAU
+      const contact = measureSunContactError(
+        expandedToothedFrames,
+        sunRadialLookup,
+        sunSpinFactor,
+        candidateOffset,
+      )
+      const phaseScore =
+        contact.overlap * 850 +
+        contact.clearance * 6 +
+        contact.minGapRms * 20 -
+        averageRadius * 0.03
+
+      if (phaseScore < localBestScore) {
+        localBestScore = phaseScore
+        localBestPhase = candidateOffset
+      }
     }
-  }
 
+    if (localBestScore < bestCombinedScore) {
+      bestCombinedScore = localBestScore
+      bestSunPitchCurve = scaledPitch
+      bestSunOutline = scaledOutline
+      sunPhaseOffset = localBestPhase
+    }
+  })
+
+  const sunPitchCurve = bestSunPitchCurve
+  const sunOutline = bestSunOutline
   const sunPitchLength = computeArcLengths(sunPitchCurve).total
-  const sunPitchError = Math.abs(sunPitchLength / toothPitch - sunToothCount)
+  const sunPitchError = Math.abs(sunPitchLength / Math.max(1e-6, ringCarve.targetSunPitchLength / ringCarve.sunToothCount) - sunToothCount)
   const sunAverageRadius = averagePerimeterRadius(sunPitchCurve)
   const sunContinuous =
     Math.abs(computeSignedArea(sunPitchCurve)) > 1 &&
@@ -1593,6 +1622,10 @@ function App() {
     () => createPitchCurve(appliedInputs.controlRadii, appliedInputs.baseBias, appliedInputs.smoothing),
     [appliedInputs.baseBias, appliedInputs.controlRadii, appliedInputs.smoothing],
   )
+  const derivedSunToothCount = useMemo(
+    () => Math.max(6, Math.round(appliedInputs.toothCount * Math.max(1, Math.abs(appliedInputs.sunTurnsPerOrbit)))),
+    [appliedInputs.sunTurnsPerOrbit, appliedInputs.toothCount],
+  )
   const basePitchLength = useMemo(() => computeArcLengths(pitchCurve).total, [pitchCurve])
   const toothPitch = basePitchLength / appliedInputs.toothCount
   const planetPitchCurve = useMemo(
@@ -1660,7 +1693,7 @@ function App() {
         cutterPitchCurve: planetPitchCurve,
         turningCenter: selectedTurningCenter,
         ringToothCount: appliedInputs.ringToothCount,
-        sunToothCount: appliedInputs.sunToothCount,
+        sunToothCount: derivedSunToothCount,
         planetTurnsPerOrbit: appliedInputs.planetTurnsPerOrbit,
         toothPitch,
         toothDepth: appliedInputs.toothDepth,
@@ -1674,7 +1707,7 @@ function App() {
       appliedInputs.planetTurnsPerOrbit,
       appliedInputs.ringThickness,
       appliedInputs.ringToothCount,
-      appliedInputs.sunToothCount,
+      derivedSunToothCount,
       appliedInputs.toothDepth,
       appliedInputs.toothSharpness,
       selectedTurningCenter,
@@ -1689,8 +1722,8 @@ function App() {
         innerToothedCutter: innerPlanetToothedCutter,
         turningCenter: selectedTurningCenter,
         planetCount: appliedInputs.planetCount,
+        planetToothCount: appliedInputs.toothCount,
         sunTurnsPerOrbit: appliedInputs.sunTurnsPerOrbit,
-        toothPitch,
         toothDepth: appliedInputs.toothDepth,
         toothSharpness: appliedInputs.toothSharpness,
       }),
@@ -1700,10 +1733,10 @@ function App() {
       ringCarve,
       selectedTurningCenter,
       appliedInputs.planetCount,
+      appliedInputs.toothCount,
       appliedInputs.sunTurnsPerOrbit,
       appliedInputs.toothDepth,
       appliedInputs.toothSharpness,
-      toothPitch,
     ],
   )
   const { carrierRadius, planetSpinFactor, sunSpinFactor, sunPhaseOffset, ringToothCount, sunToothCount } =
