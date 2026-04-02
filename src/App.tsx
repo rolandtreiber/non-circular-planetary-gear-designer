@@ -965,31 +965,29 @@ function searchRingCarve({
 
 function buildMechanismFromRingCarve({
   ringCarve,
-  innerCutter,
+  cutterOutline,
   turningCenter,
   planetToothCount,
   planetCount,
   toothPitch,
 }: {
   ringCarve: RingCarveResult
-  innerCutter: Point[]
+  cutterOutline: Point[]
   turningCenter: Point
   planetToothCount: number
   planetCount: number
   toothPitch: number
 }): MechanismGeometry {
-  const sampleCount = 240
+  const sampleCount = 360
   const sunToothCount = planetToothCount * 2
-  const averagePlanetRadius = averagePerimeterRadius(innerCutter)
   const sunSpinFactor = planetCount * 2
-  const innerFrames = samplePlanetMotion(
-    innerCutter,
+  const sunFrames = samplePlanetMotion(
+    cutterOutline,
     turningCenter,
     ringCarve.carrierRadius,
     ringCarve.planetSpinFactor,
     sampleCount,
-  )
-  const sunFrames = innerFrames.map((frame, step) => {
+  ).map((frame, step) => {
     const carrierAngle = (step / sampleCount) * TAU
     const sunRotation = carrierAngle * sunSpinFactor
     return frame.map((point) => rotatePoint(point, -sunRotation))
@@ -997,20 +995,60 @@ function buildMechanismFromRingCarve({
   const sunEnvelope = buildConjugateEnvelope(
     sunFrames,
     'inner',
-    Math.max(averagePlanetRadius * 0.32, ringCarve.carrierRadius - averagePlanetRadius),
+    ringCarve.targetSunRadius,
+    2880,
+    2,
   )
-  const scaledSunEnvelope = scaleCurveToLength(sunEnvelope, ringCarve.targetSunPitchLength)
-  const sunPitchCurve = resampleClosedPolyline(
-    scaledSunEnvelope,
-    Math.max(480, sunToothCount * 48),
-  )
+  const rawSunLength = computeArcLengths(sunEnvelope).total || 1
+  const rawSunRadius = averagePerimeterRadius(sunEnvelope) || 1
+  const lengthScale = ringCarve.targetSunPitchLength / rawSunLength
+  const radiusScale = ringCarve.targetSunRadius / rawSunRadius
+  const scaleCandidates = Array.from({ length: 9 }, (_, index) => {
+    const blend = index / 8
+    return radiusScale + (lengthScale - radiusScale) * blend
+  })
+
+  let bestSunCurve: Point[] | null = null
+  let bestSunPitchError = Number.POSITIVE_INFINITY
+  let bestSunRadiusError = Number.POSITIVE_INFINITY
+  let bestSunContinuityPenalty = Number.POSITIVE_INFINITY
+
+  scaleCandidates.forEach((scale) => {
+    const candidateCurve = resampleClosedPolyline(
+      smoothRadialEnvelope(scalePoints(sunEnvelope, scale), 1),
+      Math.max(720, sunToothCount * 56),
+    )
+    const candidateLength = computeArcLengths(candidateCurve).total
+    const candidatePitchError = Math.abs(candidateLength / toothPitch - sunToothCount)
+    const candidateAverageRadius = averagePerimeterRadius(candidateCurve)
+    const candidateRadiusError = Math.abs(candidateAverageRadius - ringCarve.targetSunRadius)
+    const candidateContinuityPenalty =
+      (Math.abs(computeSignedArea(candidateCurve)) <= 1 ? 1000 : 0) +
+      Math.max(0, maxEdgeLength(candidateCurve) / Math.max(averageEdgeLength(candidateCurve), 1e-6) - 2.2) * 30 +
+      Math.max(0, maxRadialJump(candidateCurve) / Math.max(candidateAverageRadius, 1e-6) - 0.14) * 400
+
+    const score = candidatePitchError * 12 + candidateRadiusError * 0.08 + candidateContinuityPenalty
+
+    if (
+      !bestSunCurve ||
+      score <
+        bestSunPitchError * 12 + bestSunRadiusError * 0.08 + bestSunContinuityPenalty
+    ) {
+      bestSunCurve = candidateCurve
+      bestSunPitchError = candidatePitchError
+      bestSunRadiusError = candidateRadiusError
+      bestSunContinuityPenalty = candidateContinuityPenalty
+    }
+  })
+
+  const sunPitchCurve = bestSunCurve ?? resampleClosedPolyline(sunEnvelope, Math.max(720, sunToothCount * 56))
   const sunPitchLength = computeArcLengths(sunPitchCurve).total
   const sunPitchError = Math.abs(sunPitchLength / toothPitch - sunToothCount)
   const sunAverageRadius = averagePerimeterRadius(sunPitchCurve)
   const sunContinuous =
     Math.abs(computeSignedArea(sunPitchCurve)) > 1 &&
-    maxEdgeLength(sunPitchCurve) / Math.max(averageEdgeLength(sunPitchCurve), 1e-6) < 3 &&
-    maxRadialJump(sunPitchCurve) / Math.max(sunAverageRadius, 1e-6) < 0.22 &&
+    maxEdgeLength(sunPitchCurve) / Math.max(averageEdgeLength(sunPitchCurve), 1e-6) < 2.3 &&
+    maxRadialJump(sunPitchCurve) / Math.max(sunAverageRadius, 1e-6) < 0.16 &&
     Math.abs(sunAverageRadius - ringCarve.targetSunRadius) / Math.max(ringCarve.targetSunRadius, 1e-6) < 0.18
 
   return {
@@ -1101,10 +1139,6 @@ function App() {
     () => extractTurningProfile(planetOutline, selectedTurningCenter, 'outer'),
     [planetOutline, selectedTurningCenter],
   )
-  const innerPlanetCutter = useMemo(
-    () => extractTurningProfile(planetOutline, selectedTurningCenter, 'inner'),
-    [planetOutline, selectedTurningCenter],
-  )
   const averagePlanetRadius = useMemo(
     () => averagePerimeterRadius(outerPlanetCutter),
     [outerPlanetCutter],
@@ -1134,13 +1168,13 @@ function App() {
     () =>
       buildMechanismFromRingCarve({
         ringCarve,
-        innerCutter: innerPlanetCutter,
+        cutterOutline: planetOutline,
         turningCenter: selectedTurningCenter,
         planetToothCount: toothCount,
         planetCount,
         toothPitch,
       }),
-    [innerPlanetCutter, ringCarve, selectedTurningCenter, toothCount, planetCount, toothPitch],
+    [planetOutline, ringCarve, selectedTurningCenter, toothCount, planetCount, toothPitch],
   )
   const { carrierRadius, planetSpinFactor, sunSpinFactor, ringToothCount, sunToothCount } =
     mechanism
