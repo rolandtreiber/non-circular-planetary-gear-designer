@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 type Point = {
@@ -10,12 +10,32 @@ type TurningCandidate = Point & {
   score: number
 }
 
+type SolvabilityGraph = {
+  path: Point[]
+  samples: Array<{
+    point: Point
+    v: number
+    externalDistance: number
+    internalDistance: number
+    difference: number
+  }>
+  intersections: TurningCandidate[]
+}
+
 const TAU = Math.PI * 2
 const VIEWBOX_SIZE = 880
 const EDITOR_SIZE = 320
 const CENTER = VIEWBOX_SIZE / 2
 const EDITOR_CENTER = EDITOR_SIZE / 2
-const DEFAULT_RADII = [154, 170, 148, 188, 134, 178, 144, 186, 146, 174, 138, 180]
+const GEARIFY_SAMPLE_RADII = [138, 148, 172, 148, 138, 148, 172, 148, 138, 148, 172, 148]
+const DEFAULT_BASE_BIAS = 0
+const DEFAULT_SMOOTHING = 30
+const DEFAULT_TOOTH_COUNT = 24
+const DEFAULT_TOOTH_DEPTH = 12
+const DEFAULT_TOOTH_SHARPNESS = 18
+const DEFAULT_ORBIT_RADIUS = 172
+const DEFAULT_RING_THICKNESS = 88
+const DEFAULT_TURNING_INSET = 16
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -43,13 +63,6 @@ function rotatePoint(point: Point, angle: number): Point {
   return {
     x: point.x * cos - point.y * sin,
     y: point.x * sin + point.y * cos,
-  }
-}
-
-function scalePoint(point: Point, scale: number): Point {
-  return {
-    x: point.x * scale,
-    y: point.y * scale,
   }
 }
 
@@ -188,21 +201,6 @@ function createToothedOutline(
   })
 }
 
-function pointInPolygon(point: Point, polygon: Point[]) {
-  let inside = false
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
-    const a = polygon[i]
-    const b = polygon[j]
-    const intersects =
-      a.y > point.y !== b.y > point.y &&
-      point.x < ((b.x - a.x) * (point.y - a.y)) / ((b.y - a.y) || 1e-6) + a.x
-    if (intersects) {
-      inside = !inside
-    }
-  }
-  return inside
-}
-
 function distancePointToSegment(point: Point, start: Point, end: Point) {
   const segment = { x: end.x - start.x, y: end.y - start.y }
   const lengthSquared = segment.x * segment.x + segment.y * segment.y || 1
@@ -218,62 +216,190 @@ function distancePointToSegment(point: Point, start: Point, end: Point) {
   return distance(point, projected)
 }
 
-function findTurningCandidates(points: Point[], minInset: number) {
-  let minX = Infinity
-  let maxX = -Infinity
-  let minY = Infinity
-  let maxY = -Infinity
+function computeCentroid(points: Point[]) {
+  const sum = points.reduce(
+    (acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }),
+    { x: 0, y: 0 },
+  )
+  return {
+    x: sum.x / points.length,
+    y: sum.y / points.length,
+  }
+}
+
+function computePrincipalAxis(points: Point[]) {
+  const centroid = computeCentroid(points)
+  let xx = 0
+  let xy = 0
+  let yy = 0
 
   points.forEach((point) => {
-    minX = Math.min(minX, point.x)
-    maxX = Math.max(maxX, point.x)
-    minY = Math.min(minY, point.y)
-    maxY = Math.max(maxY, point.y)
+    const dx = point.x - centroid.x
+    const dy = point.y - centroid.y
+    xx += dx * dx
+    xy += dx * dy
+    yy += dy * dy
   })
 
-  const candidates: TurningCandidate[] = []
-  const grid = 30
-  const stepX = (maxX - minX) / grid
-  const stepY = (maxY - minY) / grid
+  const trace = xx + yy
+  const det = xx * yy - xy * xy
+  const eigen = trace / 2 + Math.sqrt(Math.max(0, (trace * trace) / 4 - det))
+  const axis =
+    Math.abs(xy) > 1e-6
+      ? normalize({ x: eigen - yy, y: xy })
+      : xx >= yy
+        ? { x: 1, y: 0 }
+        : { x: 0, y: 1 }
 
-  for (let xIndex = 0; xIndex <= grid; xIndex += 1) {
-    for (let yIndex = 0; yIndex <= grid; yIndex += 1) {
-      const point = {
-        x: minX + xIndex * stepX,
-        y: minY + yIndex * stepY,
-      }
-      if (!pointInPolygon(point, points)) {
+  return { centroid, axis, normal: { x: -axis.y, y: axis.x } }
+}
+
+function projectOnAxis(point: Point, axis: Point) {
+  return point.x * axis.x + point.y * axis.y
+}
+
+function buildSolvabilityPath(points: Point[], minInset: number) {
+  const { centroid, axis, normal } = computePrincipalAxis(points)
+  const projections = points.map((point) => projectOnAxis(point, axis))
+  const minT = Math.min(...projections)
+  const maxT = Math.max(...projections)
+  const samples: Point[] = []
+  const scanCount = 80
+
+  for (let index = 0; index < scanCount; index += 1) {
+    const t = minT + ((maxT - minT) * index) / (scanCount - 1)
+    const intersections: number[] = []
+
+    for (let pointIndex = 0; pointIndex < points.length; pointIndex += 1) {
+      const start = points[pointIndex]
+      const end = points[(pointIndex + 1) % points.length]
+      const startT = projectOnAxis(start, axis)
+      const endT = projectOnAxis(end, axis)
+      const crosses =
+        (startT <= t && endT > t) || (endT <= t && startT > t) || Math.abs(startT - t) < 1e-6
+
+      if (!crosses) {
         continue
       }
 
-      let minDistance = Infinity
-      for (let i = 0; i < points.length; i += 1) {
-        minDistance = Math.min(
-          minDistance,
-          distancePointToSegment(point, points[i], points[(i + 1) % points.length]),
+      const deltaT = endT - startT
+      const lerp = Math.abs(deltaT) < 1e-6 ? 0 : (t - startT) / deltaT
+      const point = {
+        x: start.x + (end.x - start.x) * lerp,
+        y: start.y + (end.y - start.y) * lerp,
+      }
+      intersections.push(projectOnAxis(point, normal))
+    }
+
+    if (intersections.length < 2) {
+      continue
+    }
+
+    intersections.sort((a, b) => a - b)
+    let bestMidpoint: Point | null = null
+    let bestSpan = 0
+
+    for (let spanIndex = 0; spanIndex + 1 < intersections.length; spanIndex += 2) {
+      const startS = intersections[spanIndex]
+      const endS = intersections[spanIndex + 1]
+      const span = endS - startS
+      if (span <= bestSpan) {
+        continue
+      }
+      const midS = (startS + endS) / 2
+      const candidate = {
+        x: axis.x * t + normal.x * midS,
+        y: axis.y * t + normal.y * midS,
+      }
+      let edgeDistance = Infinity
+      for (let edgeIndex = 0; edgeIndex < points.length; edgeIndex += 1) {
+        edgeDistance = Math.min(
+          edgeDistance,
+          distancePointToSegment(candidate, points[edgeIndex], points[(edgeIndex + 1) % points.length]),
         )
       }
-
-      if (minDistance >= minInset) {
-        candidates.push({ ...point, score: minDistance })
+      if (edgeDistance >= minInset) {
+        bestSpan = span
+        bestMidpoint = candidate
       }
+    }
+
+    if (bestMidpoint) {
+      samples.push({
+        x: bestMidpoint.x + centroid.x * 0,
+        y: bestMidpoint.y + centroid.y * 0,
+      })
     }
   }
 
-  candidates.sort((a, b) => b.score - a.score)
-  const filtered: TurningCandidate[] = []
+  return samples.length >= 4 ? smoothRadialEnvelope(samples, 1) : samples
+}
 
-  candidates.forEach((candidate) => {
-    if (filtered.length >= 7) {
-      return
-    }
-    const tooClose = filtered.some((kept) => distance(candidate, kept) < candidate.score * 0.75)
-    if (!tooClose) {
-      filtered.push(candidate)
+function findSolvableTurningCandidates(
+  outline: Point[],
+  toothPitch: number,
+  planetToothCount: number,
+  minInset: number,
+) {
+  const path = buildSolvabilityPath(outline, minInset)
+  if (path.length < 2) {
+    return { path: [], samples: [], intersections: [] } satisfies SolvabilityGraph
+  }
+
+  const sunToothCount = planetToothCount * 2
+  const ringToothCount = sunToothCount * 2
+  const targetSunRadius = (toothPitch * sunToothCount) / TAU
+  const targetRingRadius = (toothPitch * ringToothCount) / TAU
+
+  const samples = path.map((point, index) => {
+    const relativeOutline = outline.map((outlinePoint) => ({
+      x: outlinePoint.x - point.x,
+      y: outlinePoint.y - point.y,
+    }))
+    const outerOffset = averagePerimeterRadius(relativeOutline)
+    const innerProfile = extractTurningProfile(outline, point, 'inner').map((profilePoint) => ({
+      x: profilePoint.x - point.x,
+      y: profilePoint.y - point.y,
+    }))
+    const innerOffset = averagePerimeterRadius(innerProfile)
+    const externalDistance = targetRingRadius - outerOffset
+    const internalDistance = targetSunRadius + innerOffset
+
+    return {
+      point,
+      v: path.length === 1 ? 0 : index / (path.length - 1),
+      externalDistance,
+      internalDistance,
+      difference: externalDistance - internalDistance,
     }
   })
 
-  return filtered
+  const intersections: TurningCandidate[] = []
+
+  for (let index = 0; index + 1 < samples.length; index += 1) {
+    const current = samples[index]
+    const next = samples[index + 1]
+    const currentDifference = current.difference
+    const nextDifference = next.difference
+
+    if (Math.abs(currentDifference) < 1e-3) {
+      intersections.push({ ...current.point, score: 1 / (1 + Math.abs(currentDifference)) })
+      continue
+    }
+
+    if (currentDifference * nextDifference > 0) {
+      continue
+    }
+
+    const blend = Math.abs(currentDifference) / (Math.abs(currentDifference) + Math.abs(nextDifference) || 1)
+    intersections.push({
+      x: current.point.x + (next.point.x - current.point.x) * blend,
+      y: current.point.y + (next.point.y - current.point.y) * blend,
+      score: 1 / (1 + Math.abs(currentDifference) + Math.abs(nextDifference)),
+    })
+  }
+
+  return { path, samples, intersections } satisfies SolvabilityGraph
 }
 
 function pointsToPath(points: Point[], cx: number, cy: number) {
@@ -323,16 +449,6 @@ function translatePath(points: Point[], center: Point) {
   }))
 }
 
-function transformGear(points: Point[], center: Point, rotation: number) {
-  return points.map((point) => {
-    const rotated = rotatePoint(point, rotation)
-    return {
-      x: rotated.x + center.x,
-      y: rotated.y + center.y,
-    }
-  })
-}
-
 function smoothRadialEnvelope(points: Point[], iterations: number) {
   let current = points
   for (let step = 0; step < iterations; step += 1) {
@@ -352,7 +468,7 @@ function fillRadialGaps(radial: number[], fallback: number) {
   let previous = fallback
 
   for (let index = 0; index < radial.length; index += 1) {
-    if (Number.isFinite(radial[index]) && radial[index] > 0) {
+    if (Number.isFinite(radial[index])) {
       previous = radial[index]
     } else {
       radial[index] = previous
@@ -361,7 +477,7 @@ function fillRadialGaps(radial: number[], fallback: number) {
 
   previous = radial[radial.length - 1] || fallback
   for (let index = radial.length - 1; index >= 0; index -= 1) {
-    if (Number.isFinite(radial[index]) && radial[index] > 0) {
+    if (Number.isFinite(radial[index])) {
       previous = radial[index]
     } else {
       radial[index] = previous
@@ -369,27 +485,6 @@ function fillRadialGaps(radial: number[], fallback: number) {
   }
 
   return radial
-}
-
-function buildOuterEnvelope(frames: Point[][]) {
-  const bins = 1080
-  const radial = Array.from({ length: bins }, () => 0)
-
-  frames.forEach((gear) => {
-    gear.forEach((point) => {
-      const angle = (Math.atan2(point.y, point.x) + TAU) % TAU
-      const radius = Math.hypot(point.x, point.y)
-      const bin = Math.floor((angle / TAU) * bins) % bins
-      radial[bin] = Math.max(radial[bin], radius)
-    })
-  })
-
-  const completed = fillRadialGaps(radial, 0)
-  const envelope = completed.map((radius, index) =>
-    polarToCartesian((index / completed.length) * TAU, radius),
-  )
-
-  return smoothRadialEnvelope(envelope, 3)
 }
 
 function createRingShell(innerBoundary: Point[], shellThickness: number) {
@@ -402,6 +497,73 @@ function createRingShell(innerBoundary: Point[], shellThickness: number) {
   })
 }
 
+function scalePoints(points: Point[], factor: number) {
+  return points.map((point) => ({
+    x: point.x * factor,
+    y: point.y * factor,
+  }))
+}
+
+function scaleCurveToLength(points: Point[], targetLength: number) {
+  const currentLength = computeArcLengths(points).total || 1
+  return scalePoints(points, targetLength / currentLength)
+}
+
+function createCirclePoints(radius: number, count: number) {
+  return Array.from({ length: count }, (_, index) =>
+    polarToCartesian((index / count) * TAU, radius),
+  )
+}
+
+function findRepeatTurns(values: number[], maxTurns = 120, tolerance = 1e-6) {
+  for (let turns = 1; turns <= maxTurns; turns += 1) {
+    const repeats = values.every((value) => Math.abs(value * turns - Math.round(value * turns)) < tolerance)
+    if (repeats) {
+      return turns
+    }
+  }
+
+  return 1
+}
+
+function extractTurningProfile(points: Point[], turningCenter: Point, mode: 'inner' | 'outer') {
+  const bins = 720
+  const radial = Array.from({ length: bins }, () =>
+    mode === 'outer' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+  )
+
+  points.forEach((point) => {
+    const relative = {
+      x: point.x - turningCenter.x,
+      y: point.y - turningCenter.y,
+    }
+    const angle = normalizeAngle(Math.atan2(relative.y, relative.x))
+    const radius = Math.hypot(relative.x, relative.y)
+    const bin = Math.floor((angle / TAU) * bins) % bins
+    radial[bin] =
+      mode === 'outer'
+        ? Math.max(radial[bin], radius)
+        : Math.min(radial[bin], radius)
+  })
+
+  const fallback =
+    mode === 'outer'
+      ? Math.max(...radial.filter((value) => Number.isFinite(value)), 1)
+      : Math.min(...radial.filter((value) => Number.isFinite(value)), 1)
+  const completed = fillRadialGaps(
+    radial.map((value) => (Number.isFinite(value) ? value : fallback)),
+    fallback,
+  )
+
+  return smoothRadialEnvelope(
+    completed.map((radius, index) => ({
+      x: turningCenter.x + Math.cos((index / bins) * TAU) * radius,
+      y: turningCenter.y + Math.sin((index / bins) * TAU) * radius,
+    })),
+    mode === 'outer' ? 2 : 4,
+  )
+}
+
 function formatPoint(point: Point) {
   return `${point.x.toFixed(1)}, ${point.y.toFixed(1)}`
 }
@@ -410,13 +572,52 @@ function averagePerimeterRadius(points: Point[]) {
   return computeArcLengths(points).total / TAU
 }
 
+function normalizeAngle(angle: number) {
+  return ((angle % TAU) + TAU) % TAU
+}
+
+function buildConjugateEnvelope(
+  frames: Point[][],
+  mode: 'inner' | 'outer',
+  fallback: number,
+  bins = 1440,
+  smoothingIterations = 2,
+) {
+  const radial = Array.from({ length: bins }, () =>
+    mode === 'outer' ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY,
+  )
+
+  frames.forEach((frame) => {
+    frame.forEach((point) => {
+      const angle = normalizeAngle(Math.atan2(point.y, point.x))
+      const radius = Math.hypot(point.x, point.y)
+      const bin = Math.floor((angle / TAU) * bins) % bins
+      radial[bin] =
+        mode === 'outer'
+          ? Math.max(radial[bin], radius)
+          : Math.min(radial[bin], radius)
+    })
+  })
+
+  const completed = fillRadialGaps(
+    radial.map((value) => (Number.isFinite(value) ? value : fallback)),
+    fallback,
+  )
+  const curve = completed.map((radius, index) =>
+    polarToCartesian((index / completed.length) * TAU, radius),
+  )
+
+  return smoothingIterations > 0 ? smoothRadialEnvelope(curve, smoothingIterations) : curve
+}
+
 function buildPlanetFrames(
   planetPitchCurve: Point[],
   planetOutline: Point[],
+  turningCenter: Point,
   carrierRadius: number,
   planetCount: number,
   carrierAngle: number,
-  planetSpinAngle: number,
+  planetSpinFactor: number,
 ) {
   const pitchFrames: Point[][] = []
   const outlineFrames: Point[][] = []
@@ -424,27 +625,271 @@ function buildPlanetFrames(
   for (let planetIndex = 0; planetIndex < planetCount; planetIndex += 1) {
     const orbitAngle = carrierAngle + (planetIndex / planetCount) * TAU
     const center = polarToCartesian(orbitAngle, carrierRadius)
-    const rotation = orbitAngle + planetSpinAngle
-    pitchFrames.push(transformGear(planetPitchCurve, center, rotation))
-    outlineFrames.push(transformGear(planetOutline, center, rotation))
+    const rotation = orbitAngle * planetSpinFactor
+    const transformedPitch = planetPitchCurve.map((point) => {
+      const rotated = rotatePoint(
+        { x: point.x - turningCenter.x, y: point.y - turningCenter.y },
+        rotation,
+      )
+      return {
+        x: center.x + rotated.x,
+        y: center.y + rotated.y,
+      }
+    })
+    const transformedOutline = planetOutline.map((point) => {
+      const rotated = rotatePoint(
+        { x: point.x - turningCenter.x, y: point.y - turningCenter.y },
+        rotation,
+      )
+      return {
+        x: center.x + rotated.x,
+        y: center.y + rotated.y,
+      }
+    })
+    pitchFrames.push(transformedPitch)
+    outlineFrames.push(transformedOutline)
   }
 
   return { pitchFrames, outlineFrames }
 }
 
+function samplePlanetMotion(
+  planetOutline: Point[],
+  turningCenter: Point,
+  carrierRadius: number,
+  planetSpinFactor: number,
+  sampleCount: number,
+) {
+  return Array.from({ length: sampleCount }, (_, step) => {
+    const carrierAngle = (step / sampleCount) * TAU
+    const center = polarToCartesian(carrierAngle, carrierRadius)
+    const rotation = carrierAngle * planetSpinFactor
+
+    return planetOutline.map((point) => {
+      const rotated = rotatePoint(
+        { x: point.x - turningCenter.x, y: point.y - turningCenter.y },
+        rotation,
+      )
+      return {
+        x: center.x + rotated.x,
+        y: center.y + rotated.y,
+      }
+    })
+  })
+}
+
+type MechanismGeometry = {
+  carrierRadius: number
+  planetSpinFactor: number
+  sunSpinFactor: number
+  ringToothCount: number
+  sunToothCount: number
+  ringInnerBoundary: Point[]
+  ringOuterBoundary: Point[]
+  ringPitchCurve: Point[]
+  sunOutline: Point[]
+  sunPitchCurve: Point[]
+  ringPitchError: number
+  sunPitchError: number
+  solvable: boolean
+}
+
+type RingCarveResult = {
+  carrierRadius: number
+  planetSpinFactor: number
+  ringToothCount: number
+  ringInnerBoundary: Point[]
+  ringOuterBoundary: Point[]
+  ringPitchCurve: Point[]
+  ringPitchError: number
+  baseInnerBlank: Point[]
+  baseOuterBlank: Point[]
+  targetSunPitchLength: number
+  targetSunRadius: number
+  solvable: boolean
+}
+
+type BuildStage = 'ring' | 'sun' | 'assembly'
+
+function searchRingCarve({
+  cutterOutline,
+  turningCenter,
+  planetToothCount,
+  planetCount,
+  toothPitch,
+  orbitRadius,
+  ringThickness,
+}: {
+  cutterOutline: Point[]
+  turningCenter: Point
+  planetToothCount: number
+  planetCount: number
+  toothPitch: number
+  orbitRadius: number
+  ringThickness: number
+}): RingCarveResult {
+  const averagePlanetRadius = averagePerimeterRadius(cutterOutline)
+  const outerOffsetRadius = averagePerimeterRadius(
+    cutterOutline.map((point) => ({ x: point.x - turningCenter.x, y: point.y - turningCenter.y })),
+  )
+  const sampleCount = 240
+  const sunToothCountTarget = planetToothCount * 2
+  const ringToothCountTarget = sunToothCountTarget * 2
+  const targetSunPitchLength = toothPitch * sunToothCountTarget
+  const targetRingPitchLength = toothPitch * ringToothCountTarget
+  const targetSunRadius = targetSunPitchLength / TAU
+  const targetRingRadius = targetRingPitchLength / TAU
+  const targetCarrierRadius = (targetSunRadius + targetRingRadius - outerOffsetRadius) / 2
+  const radiusCandidates = Array.from({ length: 21 }, (_, index) =>
+    clamp(targetCarrierRadius - 42 + index * 4.2, averagePlanetRadius * 0.9, targetCarrierRadius + 42),
+  )
+  const planetSpinFactor = -planetCount
+
+  let best: (RingCarveResult & { score: number }) | null = null
+
+  radiusCandidates.forEach((carrierRadius) => {
+    const ringFrames = samplePlanetMotion(
+      cutterOutline,
+      turningCenter,
+      carrierRadius,
+      planetSpinFactor,
+      sampleCount,
+    )
+    const ringEnvelope = buildConjugateEnvelope(
+      ringFrames,
+      'outer',
+      carrierRadius + averagePlanetRadius,
+      2880,
+      0,
+    )
+    const ringPitchCurve = resampleClosedPolyline(
+      ringEnvelope,
+      Math.max(720, ringToothCountTarget * 48),
+    )
+    const ringPitchLength = computeArcLengths(ringPitchCurve).total
+    const ringPitchError = Math.abs(ringPitchLength / toothPitch - ringToothCountTarget)
+
+    const continuityPenalty = Math.abs(computeSignedArea(ringPitchCurve)) < 1 ? 1000 : 0
+    const score =
+      ringPitchError * 10 +
+      Math.abs(carrierRadius - targetCarrierRadius) * 0.12 +
+      Math.abs(averagePerimeterRadius(ringPitchCurve) - targetRingRadius) * 0.02 +
+      continuityPenalty
+
+    if (!best || score < best.score) {
+      best = {
+        carrierRadius,
+        planetSpinFactor,
+        ringToothCount: ringToothCountTarget,
+        ringInnerBoundary: ringPitchCurve,
+        ringOuterBoundary: createRingShell(ringPitchCurve, ringThickness),
+        ringPitchCurve,
+        ringPitchError,
+        baseInnerBlank: createCirclePoints(averagePerimeterRadius(ringPitchCurve), 360),
+        baseOuterBlank: createCirclePoints(averagePerimeterRadius(ringPitchCurve) + ringThickness, 360),
+        targetSunPitchLength,
+        targetSunRadius,
+        solvable: ringPitchError < 0.14,
+        score,
+      }
+    }
+  })
+
+  if (best) {
+    return best
+  }
+
+  const fallbackRing = createRingShell(cutterOutline, ringThickness * 2.2)
+  return {
+    carrierRadius: targetCarrierRadius || orbitRadius,
+    planetSpinFactor: -2,
+    ringToothCount: ringToothCountTarget,
+    ringInnerBoundary: fallbackRing,
+    ringOuterBoundary: createRingShell(fallbackRing, ringThickness),
+    ringPitchCurve: fallbackRing,
+    ringPitchError: Infinity,
+    baseInnerBlank: createCirclePoints(targetRingRadius, 360),
+    baseOuterBlank: createCirclePoints(targetRingRadius + ringThickness, 360),
+    targetSunPitchLength,
+    targetSunRadius,
+    solvable: false,
+  }
+}
+
+function buildMechanismFromRingCarve({
+  ringCarve,
+  innerCutter,
+  turningCenter,
+  planetToothCount,
+  planetCount,
+  toothPitch,
+}: {
+  ringCarve: RingCarveResult
+  innerCutter: Point[]
+  turningCenter: Point
+  planetToothCount: number
+  planetCount: number
+  toothPitch: number
+}): MechanismGeometry {
+  const sampleCount = 240
+  const sunToothCount = planetToothCount * 2
+  const averagePlanetRadius = averagePerimeterRadius(innerCutter)
+  const sunSpinFactor = planetCount * 2
+  const innerFrames = samplePlanetMotion(
+    innerCutter,
+    turningCenter,
+    ringCarve.carrierRadius,
+    ringCarve.planetSpinFactor,
+    sampleCount,
+  )
+  const sunFrames = innerFrames.map((frame, step) => {
+    const carrierAngle = (step / sampleCount) * TAU
+    const sunRotation = carrierAngle * sunSpinFactor
+    return frame.map((point) => rotatePoint(point, -sunRotation))
+  })
+  const sunEnvelope = buildConjugateEnvelope(
+    sunFrames,
+    'inner',
+    Math.max(averagePlanetRadius * 0.32, ringCarve.carrierRadius - averagePlanetRadius),
+  )
+  const scaledSunEnvelope = scaleCurveToLength(sunEnvelope, ringCarve.targetSunPitchLength)
+  const sunPitchCurve = resampleClosedPolyline(
+    scaledSunEnvelope,
+    Math.max(480, sunToothCount * 48),
+  )
+  const sunPitchLength = computeArcLengths(sunPitchCurve).total
+  const sunPitchError = Math.abs(sunPitchLength / toothPitch - sunToothCount)
+
+  return {
+    carrierRadius: ringCarve.carrierRadius,
+    planetSpinFactor: ringCarve.planetSpinFactor,
+    sunSpinFactor,
+    ringToothCount: ringCarve.ringToothCount,
+    sunToothCount,
+    ringInnerBoundary: ringCarve.ringInnerBoundary,
+    ringOuterBoundary: ringCarve.ringOuterBoundary,
+    ringPitchCurve: ringCarve.ringPitchCurve,
+    sunOutline: sunPitchCurve,
+    sunPitchCurve,
+    ringPitchError: ringCarve.ringPitchError,
+    sunPitchError,
+    solvable: ringCarve.solvable && sunPitchError < 0.18,
+  }
+}
+
 function App() {
-  const [controlRadii, setControlRadii] = useState(DEFAULT_RADII)
-  const [baseBias, setBaseBias] = useState(8)
-  const [smoothing, setSmoothing] = useState(20)
-  const [toothCount, setToothCount] = useState(28)
-  const [toothDepth, setToothDepth] = useState(16)
-  const [toothSharpness, setToothSharpness] = useState(22)
+  const [controlRadii, setControlRadii] = useState(GEARIFY_SAMPLE_RADII)
+  const [baseBias, setBaseBias] = useState(DEFAULT_BASE_BIAS)
+  const [smoothing, setSmoothing] = useState(DEFAULT_SMOOTHING)
+  const [toothCount, setToothCount] = useState(DEFAULT_TOOTH_COUNT)
+  const [toothDepth, setToothDepth] = useState(DEFAULT_TOOTH_DEPTH)
+  const [toothSharpness, setToothSharpness] = useState(DEFAULT_TOOTH_SHARPNESS)
   const [planetCount, setPlanetCount] = useState(3)
-  const [orbitRadius, setOrbitRadius] = useState(196)
-  const [spinRatio, setSpinRatio] = useState(2.55)
-  const [ringThickness, setRingThickness] = useState(92)
-  const [turningInset, setTurningInset] = useState(18)
+  const [orbitRadius, setOrbitRadius] = useState(DEFAULT_ORBIT_RADIUS)
+  const [ringThickness, setRingThickness] = useState(DEFAULT_RING_THICKNESS)
+  const [turningInset, setTurningInset] = useState(DEFAULT_TURNING_INSET)
   const [selectedTurningIndex, setSelectedTurningIndex] = useState(0)
+  const [buildStage, setBuildStage] = useState<BuildStage>('ring')
   const [showPitch, setShowPitch] = useState(true)
   const [showCenters, setShowCenters] = useState(true)
   const [showTracks, setShowTracks] = useState(true)
@@ -454,81 +899,112 @@ function App() {
 
   const editorRef = useRef<SVGSVGElement | null>(null)
 
-  const pitchCurve = createPitchCurve(controlRadii, baseBias, smoothing)
-  const basePitchLength = computeArcLengths(pitchCurve).total
-  const toothPitch = basePitchLength / toothCount
   const samplesPerTooth = 40
-  const planetPitchCurve = resampleClosedPolyline(pitchCurve, toothCount * samplesPerTooth)
-  const planetOutline = createToothedOutline(
-    planetPitchCurve,
-    toothCount,
-    toothDepth,
-    toothSharpness,
+  const pitchCurve = useMemo(
+    () => createPitchCurve(controlRadii, baseBias, smoothing),
+    [controlRadii, baseBias, smoothing],
   )
-  const turningCandidates = findTurningCandidates(planetPitchCurve, turningInset)
+  const basePitchLength = useMemo(() => computeArcLengths(pitchCurve).total, [pitchCurve])
+  const toothPitch = basePitchLength / toothCount
+  const planetPitchCurve = useMemo(
+    () => resampleClosedPolyline(pitchCurve, toothCount * samplesPerTooth),
+    [pitchCurve, toothCount],
+  )
+  const planetOutline = useMemo(
+    () =>
+      createToothedOutline(planetPitchCurve, toothCount, toothDepth, toothSharpness),
+    [planetPitchCurve, toothCount, toothDepth, toothSharpness],
+  )
+  const solvabilityGraph = useMemo(
+    () => findSolvableTurningCandidates(planetOutline, toothPitch, toothCount, turningInset),
+    [planetOutline, toothPitch, toothCount, turningInset],
+  )
+  const turningCandidates = solvabilityGraph.intersections
   const safeTurningIndex =
     turningCandidates.length === 0
       ? 0
       : clamp(selectedTurningIndex, 0, turningCandidates.length - 1)
-  const selectedTurningCenter =
-    turningCandidates[safeTurningIndex] ?? turningCandidates[0] ?? { x: 0, y: 0, score: 0 }
-  const sunScale = 0.33
-  const sunBaseCurve = planetPitchCurve.map((point) => scalePoint(point, sunScale))
-  const sunPerimeter = computeArcLengths(sunBaseCurve).total
-  const sunToothCount = Math.max(8, Math.round(sunPerimeter / toothPitch))
-  const sunPitchCurve = resampleClosedPolyline(sunBaseCurve, sunToothCount * samplesPerTooth)
-  const sunOutline = createToothedOutline(
-    sunPitchCurve,
-    sunToothCount,
-    toothDepth,
-    toothSharpness,
+  const selectedTurningCenter = useMemo(
+    () => turningCandidates[safeTurningIndex] ?? turningCandidates[0] ?? { x: 0, y: 0, score: 0 },
+    [safeTurningIndex, turningCandidates],
   )
-  const averageSunRadius = averagePerimeterRadius(sunPitchCurve)
-  const averagePlanetRadius = averagePerimeterRadius(planetPitchCurve)
-  const ringToothCount = sunToothCount + toothCount * 2
-  const carrierRadius =
-    averageSunRadius +
-    averagePlanetRadius +
-    toothDepth * 0.84 +
-    (orbitRadius - 196) * 0.18
-  const carrierAngle = progress * TAU
-  const sunRotation = carrierAngle * ((sunToothCount + ringToothCount) / sunToothCount)
-  const planetSpinRelativeToCarrier =
-    -(sunToothCount / toothCount) * (sunRotation - carrierAngle)
+  const outerPlanetCutter = useMemo(
+    () => extractTurningProfile(planetOutline, selectedTurningCenter, 'outer'),
+    [planetOutline, selectedTurningCenter],
+  )
+  const innerPlanetCutter = useMemo(
+    () => extractTurningProfile(planetOutline, selectedTurningCenter, 'inner'),
+    [planetOutline, selectedTurningCenter],
+  )
+  const averagePlanetRadius = useMemo(
+    () => averagePerimeterRadius(outerPlanetCutter),
+    [outerPlanetCutter],
+  )
+  const ringCarve = useMemo(
+    () =>
+      searchRingCarve({
+        cutterOutline: planetOutline,
+        turningCenter: selectedTurningCenter,
+        planetToothCount: toothCount,
+        planetCount,
+        toothPitch,
+        orbitRadius,
+        ringThickness,
+      }),
+    [
+      orbitRadius,
+      planetOutline,
+      planetCount,
+      ringThickness,
+      selectedTurningCenter,
+      toothCount,
+      toothPitch,
+    ],
+  )
+  const mechanism = useMemo(
+    () =>
+      buildMechanismFromRingCarve({
+        ringCarve,
+        innerCutter: innerPlanetCutter,
+        turningCenter: selectedTurningCenter,
+        planetToothCount: toothCount,
+        planetCount,
+        toothPitch,
+      }),
+    [innerPlanetCutter, ringCarve, selectedTurningCenter, toothCount, planetCount, toothPitch],
+  )
+  const { carrierRadius, planetSpinFactor, sunSpinFactor, ringToothCount, sunToothCount } =
+    mechanism
+  const isSolvable = turningCandidates.length > 0 && ringCarve.solvable
+  const solvabilityCopy =
+    turningCandidates.length === 0
+      ? 'No internal turning center found for this shape.'
+      : isSolvable
+        ? 'Step 1 ring carve currently passes the app’s checks.'
+        : 'Step 1 ring carve does not currently pass the app’s checks.'
+  const loopTurns = useMemo(
+    () => findRepeatTurns([planetSpinFactor, sunSpinFactor]),
+    [planetSpinFactor, sunSpinFactor],
+  )
+  const carrierAngle = progress * TAU * loopTurns
+  const sunRotation = carrierAngle * sunSpinFactor
+  const averageSunRadius = averagePerimeterRadius(mechanism.sunPitchCurve)
   const currentFrames = buildPlanetFrames(
     planetPitchCurve,
     planetOutline,
+    selectedTurningCenter,
     carrierRadius,
     planetCount,
     carrierAngle,
-    planetSpinRelativeToCarrier,
+    planetSpinFactor,
   )
-  const ringPitchBase = buildOuterEnvelope(
-    Array.from({ length: 180 }, (_, step) => {
-      const sweepCarrier = (step / 180) * TAU
-      const sweepSunRotation = sweepCarrier * ((sunToothCount + ringToothCount) / sunToothCount)
-      const sweepSpin = -(sunToothCount / toothCount) * (sweepSunRotation - sweepCarrier)
-      return buildPlanetFrames(
-        planetPitchCurve,
-        planetOutline,
-        carrierRadius,
-        planetCount,
-        sweepCarrier,
-        sweepSpin,
-      ).pitchFrames
-    }).flat(),
-  )
-  const ringPitchCurve = resampleClosedPolyline(ringPitchBase, ringToothCount * samplesPerTooth)
-  const ringInnerBoundary = createToothedOutline(
-    ringPitchCurve,
-    ringToothCount,
-    toothDepth,
-    toothSharpness,
-    true,
-  )
-  const ringOuterBoundary = createRingShell(ringInnerBoundary, ringThickness)
-  const rotatedSunOutline = sunOutline.map((point) => rotatePoint(point, sunRotation))
-  const rotatedSunPitch = sunPitchCurve.map((point) => rotatePoint(point, sunRotation))
+  const rotatedSunOutline = mechanism.sunOutline.map((point) => rotatePoint(point, sunRotation))
+  const rotatedSunPitch = mechanism.sunPitchCurve.map((point) => rotatePoint(point, sunRotation))
+  const rotatedRingInnerBoundary = ringCarve.ringInnerBoundary
+  const rotatedRingOuterBoundary = ringCarve.ringOuterBoundary
+  const rotatedRingPitch = ringCarve.ringPitchCurve
+  const ringBlankInner = ringCarve.baseInnerBlank
+  const ringBlankOuter = ringCarve.baseOuterBlank
 
   useEffect(() => {
     let frame = 0
@@ -579,8 +1055,8 @@ function App() {
 
   const exportSvg = () => {
     const paths = []
-    const ringOuterPath = pointsToSmoothPath(ringOuterBoundary, CENTER, CENTER)
-    const ringInnerPath = pointsToSmoothPath([...ringInnerBoundary].reverse(), CENTER, CENTER)
+    const ringOuterPath = pointsToSmoothPath(rotatedRingOuterBoundary, CENTER, CENTER)
+    const ringInnerPath = pointsToSmoothPath([...rotatedRingInnerBoundary].reverse(), CENTER, CENTER)
     const trackRadius = carrierRadius
     const pitchPath = pointsToSmoothPath(planetPitchCurve, CENTER, CENTER)
 
@@ -613,6 +1089,19 @@ function App() {
   }
 
   const orbitTrack = currentFrames.outlineFrames
+  const loadGearifySample = () => {
+    setControlRadii(GEARIFY_SAMPLE_RADII)
+    setBaseBias(DEFAULT_BASE_BIAS)
+    setSmoothing(DEFAULT_SMOOTHING)
+    setToothCount(DEFAULT_TOOTH_COUNT)
+    setToothDepth(DEFAULT_TOOTH_DEPTH)
+    setToothSharpness(DEFAULT_TOOTH_SHARPNESS)
+    setPlanetCount(3)
+    setOrbitRadius(DEFAULT_ORBIT_RADIUS)
+    setRingThickness(DEFAULT_RING_THICKNESS)
+    setTurningInset(DEFAULT_TURNING_INSET)
+    setSelectedTurningIndex(0)
+  }
 
   return (
     <div className="app-shell">
@@ -622,9 +1111,14 @@ function App() {
             <p className="eyebrow">Astronomer Prototype</p>
             <h1>Non-circular planetary gear designer</h1>
           </div>
-          <button className="export-button" onClick={exportSvg}>
-            Export SVG
-          </button>
+          <div className="panel-header-actions">
+            <button className="ghost-button" onClick={loadGearifySample}>
+              Load sample
+            </button>
+            <button className="export-button" onClick={exportSvg}>
+              Export SVG
+            </button>
+          </div>
         </div>
 
         <section className="panel-card">
@@ -670,6 +1164,12 @@ function App() {
               d={pointsToSmoothPath(planetOutline, EDITOR_CENTER, EDITOR_CENTER)}
               className="planet-outline"
             />
+            {solvabilityGraph.path.length > 1 ? (
+              <path
+                d={pointsToSmoothPath(solvabilityGraph.path, EDITOR_CENTER, EDITOR_CENTER)}
+                className="solvability-path"
+              />
+            ) : null}
             {turningCandidates.map((candidate, index) => (
               <circle
                 key={`${candidate.x}-${candidate.y}`}
@@ -706,8 +1206,8 @@ function App() {
             })}
           </svg>
           <p className="card-note">
-            Drag the handles to shape the planet. Green points show feasible internal turning centers
-            extracted from the planet interior.
+            Drag the handles to shape the planet. The green curve is the sampled solvability path;
+            only its intersections where internal and external no-slip distances match are offered.
           </p>
         </section>
 
@@ -781,7 +1281,27 @@ function App() {
         <section className="panel-card grid-card">
           <div className="card-title-row">
             <h2>Mechanism</h2>
-            <span>Ring generation</span>
+            <span>Build stages</span>
+          </div>
+          <div className="stage-toggle" role="tablist" aria-label="Generation steps">
+            <button
+              className={buildStage === 'ring' ? 'stage-button active' : 'stage-button'}
+              onClick={() => setBuildStage('ring')}
+            >
+              1. Ring carve
+            </button>
+            <button
+              className={buildStage === 'sun' ? 'stage-button active' : 'stage-button'}
+              onClick={() => setBuildStage('sun')}
+            >
+              2. Sun carve
+            </button>
+            <button
+              className={buildStage === 'assembly' ? 'stage-button active' : 'stage-button'}
+              onClick={() => setBuildStage('assembly')}
+            >
+              3. Assembly
+            </button>
           </div>
           <label>
             Planets
@@ -805,18 +1325,14 @@ function App() {
             />
             <strong>{orbitRadius}</strong>
           </label>
-          <label>
-            Spin ratio
-            <input
-              type="range"
-              min="1.2"
-              max="4.8"
-              step="0.01"
-              value={spinRatio}
-              onChange={(event) => setSpinRatio(Number(event.target.value))}
-            />
-            <strong>{spinRatio.toFixed(2)}x</strong>
-          </label>
+          <div className="derived-metric">
+            <span>Planet turns / orbit</span>
+            <strong>{planetCount}</strong>
+          </div>
+          <div className="derived-metric">
+            <span>Sun turns / orbit</span>
+            <strong>{planetCount * 2}</strong>
+          </div>
           <label>
             Ring thickness
             <input
@@ -862,6 +1378,10 @@ function App() {
 
         <section className="panel-card metrics-card">
           <div>
+            <span>Solvability</span>
+            <strong>{isSolvable ? 'Likely solvable' : 'Not solved'}</strong>
+          </div>
+          <div>
             <span>Selected center</span>
             <strong>{formatPoint(selectedTurningCenter)}</strong>
           </div>
@@ -873,6 +1393,12 @@ function App() {
             <span>Teeth P/S/R</span>
             <strong>{`${toothCount} / ${sunToothCount} / ${ringToothCount}`}</strong>
           </div>
+          <div>
+            <span>Pitch errors R/S</span>
+            <strong>{`${Number.isFinite(ringCarve.ringPitchError) ? ringCarve.ringPitchError.toFixed(2) : '--'} / ${
+              Number.isFinite(mechanism.sunPitchError) ? mechanism.sunPitchError.toFixed(2) : '--'
+            }`}</strong>
+          </div>
         </section>
       </aside>
 
@@ -880,11 +1406,16 @@ function App() {
         <div className="viewport-header">
           <div>
             <p className="eyebrow">Live mechanism</p>
-            <h2>Animated ring / planet assembly</h2>
+            <h2>
+              {buildStage === 'ring'
+                ? 'Step 1: ring carve'
+                : buildStage === 'sun'
+                  ? 'Step 2: sun carve'
+                  : 'Step 3: full assembly'}
+            </h2>
           </div>
           <p className="status-copy">
-            The outer ring is generated as the swept envelope of the rotating planets around the
-            fixed sun gear, then re-toothed on the same shared pitch.
+            {solvabilityCopy}
           </p>
         </div>
 
@@ -911,16 +1442,34 @@ function App() {
           <rect width={VIEWBOX_SIZE} height={VIEWBOX_SIZE} rx="34" fill="url(#viewport-bg)" />
 
           <path
-            d={`${pointsToSmoothPath(ringOuterBoundary, CENTER, CENTER)} ${pointsToSmoothPath(
-              [...ringInnerBoundary].reverse(),
-              CENTER,
-              CENTER,
-            )}`}
+            d={`${
+              buildStage === 'ring'
+                ? `${pointsToSmoothPath(ringBlankOuter, CENTER, CENTER)} ${pointsToSmoothPath(
+                    [...ringBlankInner].reverse(),
+                    CENTER,
+                    CENTER,
+                  )}`
+                : `${pointsToSmoothPath(rotatedRingOuterBoundary, CENTER, CENTER)} ${pointsToSmoothPath(
+                    [...rotatedRingInnerBoundary].reverse(),
+                    CENTER,
+                    CENTER,
+                  )}`
+            }`}
             fill="url(#ring-fill)"
             fillRule="evenodd"
             stroke="#f7f2e8"
             strokeWidth="2.5"
           />
+
+          {buildStage === 'ring' ? (
+            <path
+              d={pointsToSmoothPath(rotatedRingInnerBoundary, CENTER, CENTER)}
+              fill="none"
+              stroke="#f0b758"
+              strokeWidth="2.1"
+              opacity="0.9"
+            />
+          ) : null}
 
           {showTracks ? (
             <circle
@@ -944,30 +1493,34 @@ function App() {
                 opacity="0.42"
               />
               <path
-                d={pointsToSmoothPath(ringPitchCurve, CENTER, CENTER)}
+                d={pointsToSmoothPath(rotatedRingPitch, CENTER, CENTER)}
                 fill="none"
                 stroke="#8fd3ff"
                 strokeWidth="1.4"
                 opacity="0.34"
               />
-              <path
-                d={pointsToSmoothPath(rotatedSunPitch, CENTER, CENTER)}
-                fill="none"
-                stroke="#ffe082"
-                strokeWidth="1.3"
-                opacity="0.45"
-              />
+              {buildStage !== 'ring' ? (
+                <path
+                  d={pointsToSmoothPath(rotatedSunPitch, CENTER, CENTER)}
+                  fill="none"
+                  stroke="#ffe082"
+                  strokeWidth="1.3"
+                  opacity="0.45"
+                />
+              ) : null}
             </>
           ) : null}
 
-          <path
-            d={pointsToSmoothPath(rotatedSunOutline, CENTER, CENTER)}
-            fill="#f0b758"
-            stroke="#fff2d8"
-            strokeWidth="1.5"
-          />
+          {buildStage !== 'ring' ? (
+            <path
+              d={pointsToSmoothPath(rotatedSunOutline, CENTER, CENTER)}
+              fill="#f0b758"
+              stroke="#fff2d8"
+              strokeWidth="1.5"
+            />
+          ) : null}
 
-          {orbitTrack.map((planet, index) => (
+          {(buildStage === 'ring' ? currentFrames.outlineFrames.slice(0, 1) : orbitTrack).map((planet, index) => (
             <path
               key={`planet-${index}`}
               d={pointsToSmoothPath(translatePath(planet, { x: CENTER, y: CENTER }), 0, 0)}
@@ -997,6 +1550,7 @@ function App() {
             y="68"
             className="viewport-label"
           >{`Avg radii P/S: ${averagePlanetRadius.toFixed(1)} / ${averageSunRadius.toFixed(1)}`}</text>
+          <text x="28" y="94" className="viewport-label">{`Loop turns: ${loopTurns}`}</text>
         </svg>
       </main>
     </div>

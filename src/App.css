@@ -54,15 +54,32 @@
   max-width: 12ch;
 }
 
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ghost-button,
 .export-button {
   border: 0;
   border-radius: 999px;
   padding: 0.85rem 1.15rem;
   font: inherit;
+  cursor: pointer;
+}
+
+.ghost-button {
+  font-weight: 600;
+  color: var(--heading);
+  background: rgba(130, 156, 171, 0.12);
+  border: 1px solid var(--panel-border);
+}
+
+.export-button {
   font-weight: 700;
   color: #081015;
   background: linear-gradient(135deg, #f0b758, #83f2d3);
-  cursor: pointer;
 }
 
 .panel-card {
@@ -96,6 +113,13 @@
   fill: rgba(103, 225, 187, 0.12);
   stroke: #87f1d0;
   stroke-width: 2.1;
+}
+
+.solvability-path {
+  fill: none;
+  stroke: #51d38e;
+  stroke-width: 2;
+  opacity: 0.9;
 }
 
 .turning-candidate {
@@ -144,6 +168,13 @@
   font-size: 0.95rem;
 }
 
+.derived-metric {
+  display: grid;
+  gap: 8px;
+  color: var(--heading);
+  font-size: 0.95rem;
+}
+
 .grid-card input[type='range'] {
   width: 100%;
 }
@@ -158,6 +189,28 @@
   flex-wrap: wrap;
 }
 
+.stage-toggle {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stage-button {
+  border: 1px solid var(--panel-border);
+  background: rgba(130, 156, 171, 0.08);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 0.55rem 0.85rem;
+  cursor: pointer;
+}
+
+.stage-button.active {
+  background: rgba(240, 183, 88, 0.16);
+  color: var(--heading);
+  border-color: rgba(240, 183, 88, 0.45);
+}
+
 .checkbox {
   display: inline-flex;
   align-items: center;
@@ -166,6 +219,7 @@
 }
 
 .metrics-card {
+  flex-wrap: wrap;
   justify-content: space-around;
   text-align: center;
 }
@@ -173,6 +227,7 @@
 .metrics-card div {
   display: grid;
   gap: 4px;
+  min-width: 120px;
 }
 
 .metrics-card strong {
@@ -221,6 +276,10 @@
   .viewport-header,
   .metrics-card {
     flex-direction: column;
+  }
+
+  .panel-header-actions {
+    width: 100%;
   }
 
   .status-copy {
